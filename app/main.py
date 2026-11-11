@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
 from .csv_parser import CsvIssue, CsvValidationError, parse_results_csv, parse_tasks_csv
+from .curve import CurveValidationError, fit_curve, format_fraction, parse_curve_request
 from .domain import ResultRecord, TaskRecord, format_utc
 from .optimizer import (
     AmbiguousResult as OptimizerAmbiguousResult,
@@ -19,12 +21,18 @@ from .optimizer import (
 from .schemas import (
     AmbiguousResult,
     AmbiguousTask,
+    ConcentrationInterval,
     CsvErrorResponse,
+    CurveErrorResponse,
+    CurveSummary,
     DefinitePair,
+    FittedNode,
     PossibleResultMatch,
     PossibleTaskMatch,
     ReconciliationResponse,
     ReconciliationSummary,
+    StandardCurveResponse,
+    UnknownConversion,
 )
 
 DEMO_DIR = Path(__file__).resolve().parent.parent / "demo"
@@ -55,11 +63,22 @@ _DESCRIPTION = """
 - [结果 CSV](/demo/results.csv)
 
 下载上述两个文件后，在下方接口点击 *Try it out* 分别选择文件即可运行。
+
+**标准曲线换算（`POST /v1/standard-curve-conversions`）**
+
+接收仪器导出的 2~12 个标准点（浓度、信号、正整数权重）、正斜率上限与最多 30 个
+待测信号。按浓度排序后，在“拟合节点不降、相邻增量 ≤ 斜率上限 × 浓度差”的约束下
+使加权信号残差平方和最小；全程有理数精确求解，拟合节点以最简分数返回。节点间线性
+插值，仅在标准浓度范围内反算，逐个返回待测信号的完整浓度闭区间；平台段整段保留，
+超出拟合信号范围标为无法换算，不外推。Swagger UI 中内置**斜率受限**与**平台段**
+两个可直接运行的示例，也可下载演示请求
+[斜率受限](/demo/curve_slope_limited.json) / [平台段](/demo/curve_plateau.json)。
 """
 
 _TAGS_METADATA = [
     {"name": "核对", "description": "上传两份 CSV，返回确定配对与逐条歧义信息。"},
-    {"name": "演示数据", "description": "用于 Swagger UI 试运行的歧义演示 CSV。"},
+    {"name": "换算", "description": "标准曲线斜率受限加权拟合与待测信号浓度反算。"},
+    {"name": "演示数据", "description": "用于 Swagger UI 试运行的歧义演示 CSV 与标准曲线演示 JSON。"},
     {"name": "运维", "description": "服务健康检查与文档入口。"},
 ]
 
@@ -106,6 +125,17 @@ def index() -> HTMLResponse:
   -F "results=@demo/results.csv;type=text/csv"</pre>
   <p>演示数据含对称多候选、任务竞争、唯一最优、始终未配对等情况，适合验证 <code>definite_pairs</code> 与
   <code>ambiguous_tasks</code>/<code>ambiguous_results</code> 的区别。</p>
+  <h2>标准曲线换算</h2>
+  <p>提交 2~12 个标准点、正斜率上限与待测信号，返回最简分数形式的拟合节点与每个待测信号的完整浓度闭区间；
+  平台段整段保留，超出拟合信号范围不外推。</p>
+  <ul>
+    <li><a href="/demo/curve_slope_limited.json">演示请求：斜率受限</a> /
+        <a href="/demo/curve_plateau.json">演示请求：平台段</a>
+        （Swagger UI 的 <code>POST /v1/standard-curve-conversions</code> 中内置同名可运行示例）</li>
+  </ul>
+  <pre>curl -X POST http://localhost:8000/v1/standard-curve-conversions \\
+  -H "Content-Type: application/json" \\
+  --data-binary @demo/curve_plateau.json</pre>
 </body>
 </html>"""
     )
@@ -319,3 +349,180 @@ async def reconcile_endpoint(
 
     decision = reconcile(task_records, result_records)
     return _build_response(decision, task_records, result_records)
+
+
+_SLOPE_LIMITED_EXAMPLE: dict[str, Any] = {
+    "standards": [
+        {"concentration": 0, "signal": "0.010", "weight": 1},
+        {"concentration": 1, "signal": "0.040", "weight": 1},
+        {"concentration": 2, "signal": "0.900", "weight": 1},
+        {"concentration": 3, "signal": "1.200", "weight": 1},
+        {"concentration": 4, "signal": "1.100", "weight": 1},
+    ],
+    "slope_limit": "0.25",
+    "unknown_signals": ["0.300", "1.050", "0.100", "1.200"],
+}
+
+_PLATEAU_EXAMPLE: dict[str, Any] = {
+    "standards": [
+        {"concentration": 0, "signal": "1.00", "weight": 1},
+        {"concentration": 1, "signal": "0.90", "weight": 1},
+        {"concentration": 2, "signal": "0.95", "weight": 2},
+        {"concentration": 3, "signal": "2.00", "weight": 1},
+        {"concentration": 4, "signal": "2.10", "weight": 1},
+    ],
+    "slope_limit": "5",
+    "unknown_signals": ["0.95", "1.50", "0.50"],
+}
+
+_CURVE_DESCRIPTION = """
+接收仪器导出的标准点、正斜率上限与待测信号，返回最简分数形式的拟合节点，并逐个
+反算待测信号对应的完整浓度闭区间。
+
+**输入契约**
+- `standards`：2~12 个标准点。`concentration` 为互异的非负整数（≤ 999999999）；
+  `signal` 为十进制字符串；`weight` 为正整数（≤ 1000000）。
+- `slope_limit`：正斜率上限，十进制字符串。
+- `unknown_signals`：最多 30 个待测信号，均为十进制字符串。
+- 十进制字符串允许形如 `12`、`-3.5`、`0.125`、`1e-3`；拒绝 NaN/Infinity。
+
+**拟合规则**
+- 按浓度升序排列；拟合节点 f 须不降，且相邻增量 f(i+1) − f(i) ≤ 斜率上限 × 浓度差。
+- 在上述约束下使加权信号残差平方和 Σ w_i·(f_i − y_i)² 最小。
+- 全程有理数精确求解；拟合节点与残差平方和均以最简分数返回（分母为 1 时只给整数）。
+
+**反算规则**
+- 节点间线性插值，仅在标准浓度范围内反算，不外推。
+- 每个待测信号返回完整浓度闭区间 `[lower, upper]`；平台段（相邻拟合节点相等）整段保留。
+- 信号超出拟合信号范围时 `status = "out_of_range"`，不给出区间。
+
+**错误定位**：非法输入返回 422，`detail.errors[*].loc` 以 JSON 路径定位
+（如 `["standards", 2, "signal"]`），一次返回全部问题。
+
+演示请求可下载：[斜率受限](/demo/curve_slope_limited.json)、
+[平台段](/demo/curve_plateau.json)。
+"""
+
+
+@app.post(
+    "/v1/standard-curve-conversions",
+    response_model=StandardCurveResponse,
+    tags=["换算"],
+    summary="标准曲线换算：斜率受限加权拟合与待测信号反算",
+    description=_CURVE_DESCRIPTION,
+    responses={
+        422: {
+            "model": CurveErrorResponse,
+            "description": "请求体非法；errors 逐项给出 JSON 路径定位。",
+        }
+    },
+)
+def standard_curve_conversion(
+    payload: dict[str, Any] = Body(
+        ...,
+        openapi_examples={
+            "slope_limited": {
+                "summary": "斜率受限示例",
+                "description": (
+                    "原始信号中段上升过快，被斜率上限 0.25 截断；拟合节点为 "
+                    "13/80, 33/80, 53/80, 73/80, 11/10。信号 0.100 与 1.200 超出拟合"
+                    "信号范围，标为无法换算（不外推）。"
+                ),
+                "value": _SLOPE_LIMITED_EXAMPLE,
+            },
+            "plateau": {
+                "summary": "平台段示例",
+                "description": (
+                    "前三个标准点噪声引起倒挂，被加权池化为平台 19/20（覆盖浓度 0~2）；"
+                    "信号 0.95 命中平台，返回整段闭区间 [0, 2]。"
+                ),
+                "value": _PLATEAU_EXAMPLE,
+            },
+        },
+    ),
+) -> StandardCurveResponse:
+    try:
+        request = parse_curve_request(payload)
+    except CurveValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "curve_validation_error",
+                "message": exc.message,
+                "errors": [
+                    {"loc": list(issue.loc), "message": issue.message} for issue in exc.issues
+                ],
+            },
+        ) from None
+
+    curve = fit_curve(request.standards, request.slope_limit)
+
+    conversions: list[UnknownConversion] = []
+    for unknown in request.unknown_signals:
+        interval = curve.invert(unknown.value)
+        if interval is None:
+            conversions.append(
+                UnknownConversion(signal=unknown.raw, status="out_of_range", concentration_interval=None)
+            )
+        else:
+            lower, upper = interval
+            conversions.append(
+                UnknownConversion(
+                    signal=unknown.raw,
+                    status="ok",
+                    concentration_interval=ConcentrationInterval(
+                        lower=format_fraction(lower), upper=format_fraction(upper)
+                    ),
+                )
+            )
+
+    return StandardCurveResponse(
+        summary=CurveSummary(
+            standard_count=len(request.standards),
+            unknown_count=len(request.unknown_signals),
+            slope_limit=payload["slope_limit"],
+            min_concentration=curve.concentrations[0],
+            max_concentration=curve.concentrations[-1],
+            min_fitted_signal=format_fraction(curve.fitted[0]),
+            max_fitted_signal=format_fraction(curve.fitted[-1]),
+            weighted_residual_sum_squares=format_fraction(curve.weighted_residual_sum_squares),
+        ),
+        fitted_nodes=[
+            FittedNode(
+                concentration=point.concentration,
+                observed_signal=point.signal_raw,
+                weight=point.weight,
+                fitted_signal=format_fraction(fitted_value),
+            )
+            for point, fitted_value in zip(request.standards, curve.fitted)
+        ],
+        conversions=conversions,
+    )
+
+
+@app.get(
+    "/demo/curve_slope_limited.json",
+    tags=["演示数据"],
+    summary="下载斜率受限演示请求 JSON",
+    response_class=FileResponse,
+)
+def demo_curve_slope_limited() -> FileResponse:
+    return FileResponse(
+        DEMO_DIR / "curve_slope_limited.json",
+        media_type="application/json; charset=utf-8",
+        filename="curve_slope_limited.json",
+    )
+
+
+@app.get(
+    "/demo/curve_plateau.json",
+    tags=["演示数据"],
+    summary="下载平台段演示请求 JSON",
+    response_class=FileResponse,
+)
+def demo_curve_plateau() -> FileResponse:
+    return FileResponse(
+        DEMO_DIR / "curve_plateau.json",
+        media_type="application/json; charset=utf-8",
+        filename="curve_plateau.json",
+    )

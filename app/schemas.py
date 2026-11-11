@@ -114,3 +114,74 @@ class CsvErrorDetail(BaseModel):
 
 class CsvErrorResponse(BaseModel):
     detail: CsvErrorDetail
+
+
+_FRACTION_DESCRIPTION = "最简分数形式（如 \"3/4\"）；分母为 1 时只给整数（如 \"2\"）。"
+
+
+class FittedNode(BaseModel):
+    concentration: int = Field(description="标准点浓度（非负整数，按升序返回）。")
+    observed_signal: str = Field(description="仪器导出的原始信号文本。")
+    weight: int = Field(description="该标准点的正整数权重。")
+    fitted_signal: str = Field(description=f"拟合节点信号值。{_FRACTION_DESCRIPTION}")
+
+
+class ConcentrationInterval(BaseModel):
+    lower: str = Field(description=f"浓度闭区间下界。{_FRACTION_DESCRIPTION}")
+    upper: str = Field(description=f"浓度闭区间上界。{_FRACTION_DESCRIPTION}")
+
+
+class UnknownConversion(BaseModel):
+    signal: str = Field(description="待测信号原始文本。")
+    status: Literal["ok", "out_of_range"] = Field(
+        description=(
+            "ok：已换算，见 concentration_interval；"
+            "out_of_range：信号超出拟合信号范围，无法换算（不外推）。"
+        )
+    )
+    concentration_interval: ConcentrationInterval | None = Field(
+        description=(
+            "完整浓度闭区间；平台段（相邻拟合节点相等）整段保留。"
+            "status 为 out_of_range 时为 null。"
+        )
+    )
+
+
+class CurveSummary(BaseModel):
+    standard_count: int = Field(description="接受的标准点数（2~12）。")
+    unknown_count: int = Field(description="接受的待测信号数（最多 30）。")
+    slope_limit: str = Field(description="本次使用的正斜率上限（原始文本）。")
+    min_concentration: int = Field(description="标准浓度范围下界。")
+    max_concentration: int = Field(description="标准浓度范围上界。")
+    min_fitted_signal: str = Field(description=f"拟合信号范围下界（首节点）。{_FRACTION_DESCRIPTION}")
+    max_fitted_signal: str = Field(description=f"拟合信号范围上界（末节点）。{_FRACTION_DESCRIPTION}")
+    weighted_residual_sum_squares: str = Field(
+        description=f"最小加权信号残差平方和 Σ w_i·(f_i−y_i)²。{_FRACTION_DESCRIPTION}"
+    )
+
+
+class StandardCurveResponse(BaseModel):
+    summary: CurveSummary
+    fitted_nodes: list[FittedNode] = Field(
+        description="按浓度升序的拟合节点；相邻节点不降，且增量不超过斜率上限乘浓度差。"
+    )
+    conversions: list[UnknownConversion] = Field(
+        description="与请求 unknown_signals 一一对应的换算结果。"
+    )
+
+
+class CurveErrorItem(BaseModel):
+    loc: list[str | int] = Field(
+        description='非法输入的 JSON 路径，如 ["standards", 2, "signal"]；整体错误为空数组。'
+    )
+    message: str
+
+
+class CurveErrorDetail(BaseModel):
+    code: str = Field(examples=["curve_validation_error"])
+    message: str
+    errors: list[CurveErrorItem]
+
+
+class CurveErrorResponse(BaseModel):
+    detail: CurveErrorDetail

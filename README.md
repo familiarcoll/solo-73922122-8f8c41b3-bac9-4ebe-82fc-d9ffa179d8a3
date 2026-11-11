@@ -7,6 +7,8 @@
 
 服务不在有歧义时擅自挑选一个“看起来最像”的配对，从而避免误归属。
 
+另提供**标准曲线换算**接口：接收仪器导出的 2~12 个标准点（浓度、信号、正整数权重）、正斜率上限与最多 30 个待测信号，在“拟合节点不降、相邻增量 ≤ 斜率上限 × 浓度差”约束下使加权信号残差平方和最小，用有理数精确求解并以最简分数返回拟合节点；随后按节点间线性插值在标准浓度范围内反算每个待测信号的完整浓度闭区间，平台段整段保留，超出拟合信号范围标为无法换算，不外推。这样标准点噪声不会造成浓度倒挂。
+
 ## 快速启动
 
 ```bash
@@ -17,11 +19,13 @@ docker compose up --build
 
 | 地址 | 用途 |
 | --- | --- |
-| <http://localhost:8000/docs> | Swagger UI，可直接上传两份 CSV 试运行 |
+| <http://localhost:8000/docs> | Swagger UI，可上传 CSV 或运行内置标准曲线示例 |
 | <http://localhost:8000/redoc> | ReDoc |
 | <http://localhost:8000/openapi.json> | OpenAPI 文档 |
 | <http://localhost:8000/demo/tasks.csv> | 含歧义的演示任务 CSV |
 | <http://localhost:8000/demo/results.csv> | 含歧义的演示结果 CSV |
+| <http://localhost:8000/demo/curve_slope_limited.json> | 标准曲线演示请求（斜率受限） |
+| <http://localhost:8000/demo/curve_plateau.json> | 标准曲线演示请求（平台段） |
 | <http://localhost:8000/health> | 容器健康检查 |
 
 如 8000 端口被占用：`APP_PORT=8080 docker compose up --build`。停止服务用 `docker compose down`。
@@ -32,9 +36,13 @@ docker compose up --build
 curl -X POST http://localhost:8000/v1/reconciliations \
   -F "tasks=@demo/tasks.csv;type=text/csv" \
   -F "results=@demo/results.csv;type=text/csv"
+
+curl -X POST http://localhost:8000/v1/standard-curve-conversions \
+  -H "Content-Type: application/json" \
+  --data-binary @demo/curve_plateau.json
 ```
 
-在 Swagger UI 中打开 `POST /v1/reconciliations`，点击 **Try it out**，两个文件字段分别选择上面下载的演示 CSV，再点击 **Execute**。
+在 Swagger UI 中打开 `POST /v1/reconciliations`，点击 **Try it out**，两个文件字段分别选择上面下载的演示 CSV，再点击 **Execute**。标准曲线接口打开 `POST /v1/standard-curve-conversions` 后在 **Examples** 下拉框中选择“斜率受限示例”或“平台段示例”即可直接运行。
 
 ## 接口
 
@@ -148,6 +156,96 @@ CSV 格式、表头、字段值、行数或时间格式不合规时返回 `422`�
 
 `row` 是 CSV 物理行号，表头为第 1 行。两个文件都会校验，便于一次修正全部问题。
 
+## 标准曲线换算
+
+### `POST /v1/standard-curve-conversions`
+
+`application/json`。用于把仪器信号换算成浓度：先对标准点做**斜率受限的加权最小二乘拟合**，
+再对待测信号做**不外推的反算**。
+
+请求体：
+
+```json
+{
+  "standards": [
+    {"concentration": 0, "signal": "1.00", "weight": 1},
+    {"concentration": 1, "signal": "0.90", "weight": 1},
+    {"concentration": 2, "signal": "0.95", "weight": 2},
+    {"concentration": 3, "signal": "2.00", "weight": 1},
+    {"concentration": 4, "signal": "2.10", "weight": 1}
+  ],
+  "slope_limit": "5",
+  "unknown_signals": ["0.95", "1.50", "0.50"]
+}
+```
+
+| 字段 | 规则 |
+| --- | --- |
+| `standards` | 2~12 个标准点 |
+| `standards[].concentration` | 非负整数（≤ 999999999），互异；JSON 数字，不接受字符串/布尔/小数 |
+| `standards[].signal` | 十进制字符串，如 `"0.125"`、`"1e-3"`；拒绝 NaN/Infinity |
+| `standards[].weight` | 正整数（≤ 1000000） |
+| `slope_limit` | 正斜率上限，十进制字符串 |
+| `unknown_signals` | 最多 30 个待测信号，均为十进制字符串 |
+
+**拟合规则**：按浓度升序排列后，拟合节点 `f` 须不降，且相邻增量
+`f(i+1) − f(i) ≤ slope_limit × 浓度差`；在此约束下使 `Σ w_i·(f_i − y_i)²` 最小。
+全程用 `Fraction` 有理数精确求解（原始积极集法解凸二次规划，解唯一），
+拟合节点与最小残差平方和都以**最简分数**返回（分母为 1 时只给整数，如 `"2"`）。
+
+**反算规则**：节点间线性插值，仅在标准浓度范围内反算。每个待测信号返回完整浓度
+闭区间 `[lower, upper]`——曲线连续且不降，原像必为闭区间；平台段（相邻拟合节点
+相等）整段保留。信号超出拟合信号范围 `[f_1, f_n]` 时 `status = "out_of_range"`，
+不给出区间、不外推。
+
+成功响应（200）节选：
+
+```json
+{
+  "summary": {
+    "standard_count": 5,
+    "unknown_count": 3,
+    "slope_limit": "5",
+    "min_concentration": 0,
+    "max_concentration": 4,
+    "min_fitted_signal": "19/20",
+    "max_fitted_signal": "21/10",
+    "weighted_residual_sum_squares": "1/200"
+  },
+  "fitted_nodes": [
+    {"concentration": 0, "observed_signal": "1.00", "weight": 1, "fitted_signal": "19/20"}
+  ],
+  "conversions": [
+    {"signal": "0.95", "status": "ok", "concentration_interval": {"lower": "0", "upper": "2"}},
+    {"signal": "1.50", "status": "ok", "concentration_interval": {"lower": "53/21", "upper": "53/21"}},
+    {"signal": "0.50", "status": "out_of_range", "concentration_interval": null}
+  ]
+}
+```
+
+上例即 `/docs` 中的“平台段示例”（演示文件
+[`demo/curve_plateau.json`](demo/curve_plateau.json)）：前三个标准点因噪声出现倒挂，
+被加权池化为平台 `19/20`，覆盖浓度 0~2 整段；信号 `0.95` 命中平台，返回整段闭区间
+`[0, 2]`。“斜率受限示例”（[`demo/curve_slope_limited.json`](demo/curve_slope_limited.json)）
+则演示中段信号被斜率上限 `0.25` 截断，以及两个方向越界信号的 `out_of_range` 标记。
+
+#### 换算接口错误
+
+非法输入返回 `422`，`errors` 一次性列出全部问题并用 JSON 路径定位：
+
+```json
+{
+  "detail": {
+    "code": "curve_validation_error",
+    "message": "请求存在 2 处非法输入。",
+    "errors": [
+      {"loc": ["standards", 1, "concentration"], "message": "浓度 0 与第 0 个标准点重复；浓度必须互异。"},
+      {"loc": ["slope_limit"], "message": "斜率上限必须是正数，实际为 '0'。"}
+    ]
+  }
+}
+```
+
 ## CSV 格式
 
 UTF-8（可带 BOM），逗号分隔；也兼容分号、制表符分隔。空白数据行会被跳过。
@@ -246,7 +344,9 @@ pytest -q
 
 - CSV 别名、合并时段、BOM、分号分隔、严格 UTC 校验、30 行上限、重复编号与数值校验；
 - 随机小规模图与穷举所有匹配的交叉验证（确定配对、候选并集、可能未配对均逐项比对）；
-- 演示数据预期、API 成功/422 响应、OpenAPI 与演示文件可用性。
+- 标准曲线：十进制字符串严格校验与逐字段定位、积极集法与穷举积极集暴力解的随机交叉验证
+  （Fraction 精确相等）、平台段整段保留、精确分数插值、越界不外推；
+- 演示数据预期、API 成功/422 响应、OpenAPI 与演示文件可用性、/docs 内置示例可运行。
 
 ## 文件结构
 
@@ -254,12 +354,15 @@ pytest -q
 app/
   main.py          FastAPI 路由、OpenAPI 描述、响应组装
   csv_parser.py    严格 CSV 解析与中文/英文表头别名
+  curve.py         标准曲线：输入校验、斜率受限 QP 精确求解、信号反算
   domain.py        任务与结果领域对象、UTC 格式化
   optimizer.py     最大流最小费用 + 零费用残量图 SCC 分类
   schemas.py       Pydantic 响应/错误模型（OpenAPI 文档来源）
 demo/
   tasks.csv        歧义演示任务
   results.csv      歧义演示结果
+  curve_slope_limited.json   标准曲线演示请求（斜率受限）
+  curve_plateau.json         标准曲线演示请求（平台段）
 tests/
 Dockerfile
 docker-compose.yml

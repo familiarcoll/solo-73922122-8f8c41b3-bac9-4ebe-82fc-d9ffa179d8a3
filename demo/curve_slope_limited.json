@@ -1,0 +1,11 @@
+{
+  "standards": [
+    {"concentration": 0, "signal": "0.010", "weight": 1},
+    {"concentration": 1, "signal": "0.040", "weight": 1},
+    {"concentration": 2, "signal": "0.900", "weight": 1},
+    {"concentration": 3, "signal": "1.200", "weight": 1},
+    {"concentration": 4, "signal": "1.100", "weight": 1}
+  ],
+  "slope_limit": "0.25",
+  "unknown_signals": ["0.300", "1.050", "0.100", "1.200"]
+}
